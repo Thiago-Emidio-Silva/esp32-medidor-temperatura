@@ -1,0 +1,403 @@
+//BIBLIOTECAS UTILIZADAS PARA ESP32-WROOM-32
+#include <WiFi.h> // Biblioteca WIFI
+#include <Firebase_ESP_Client.h> // Biblioteca FIREBASE Client
+#include <SPI.h> // Biblioteca padrão
+#include <WiFiUdp.h> // Acesso a comunicação UDP
+#include <NTPClient.h> //Biblioteca para NTP - RELOGIO ONLINE
+#include <addons/RTDBHelper.h> // Fornece as informações de impressão da carga útil do RTDB e outras funções auxiliares.
+#include <WiFiManager.h> // Biblioteca WIFI Manager, utilizado para entrar na rede WIFI
+#include <WiFiClient.h> // Biblioteca WIFI Client para comunicação
+#include <WebServer.h> // Servidor HTTP-WEB 
+#include <Preferences.h> // Acesso a memória flash do hardware
+#include <max6675.h> // Biblioteca para leitura da temperatura
+WebServer server(80); // Porta padrão de comunucação para servidor WEB
+
+//Dados do banco de dados FIREBASE
+#define DATABASE_URL "URL Banco de dados"
+#define DATABASE_SECRET "Banco de dados"
+#define API_KEY "Banco de dados"
+
+//Define os Data object do FIREBASE
+FirebaseData fbdo;
+
+// Define firebaseAuth para autenticação do Banco de Dados
+FirebaseAuth auth;
+
+// Define as configurações do Banco de Dados
+FirebaseConfig config;
+
+//Fuso Horário
+int horaVerao = -3;
+
+//Configuração do relógio online
+WiFiUDP udp;
+NTPClient ntpClient(udp, "0.br.pool.ntp.org", horaVerao * 3600, 60000);/* Cria um objeto "NTP" com as configurações.utilizada no Brasil */
+
+//Estruturação dos nomes dias da semana, utilizado para datas
+char* dayOfWeekNames[] = {"DOMINGO", "SEGUNDA", "TERÇA", "QUARTA", "QUINTA", "SEXTA", "SABADO"};
+
+//Estrutura com os dados do dia e hora
+struct Date{
+    int dayOfWeek;
+    int day;
+    int month;
+    int year;
+    int hours;
+    int minutes;
+    int seconds;
+};
+
+// Variáveis que armazenam hora do servido NTP
+unsigned long dataMillis = 0;
+int count = 0;
+int LED_BUILTIN = 2;
+int temp = 0;
+int setpoint = 0;
+
+String datas;
+String horarios;
+
+//Criação do objeto preferences para acesso a memória FLASH do hardware
+Preferences preferences;
+
+//Definições do cadastro do equipameto para controle do software
+String id_dispositivo = "SA631267eb7ccf4";
+String id_usuario;
+String email;
+String senha;
+
+//Definições do sensor de temperatura
+int thermoDO  = 4;
+int thermoCS  = 5;
+int thermoCLK = 19;
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+float valTemperatura;
+
+int rele = 12;
+
+void setup()
+{
+  Serial.begin(115200); // Iniciando serial
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(rele, OUTPUT);
+
+// Chamando leitura/gravação memória flash
+  get_preferences(); 
+
+// Chamando wifi manager para conexão da rede WIFI
+  inicia_wifi_manager();
+
+// Verifica o status da rede WIFI
+  if (WiFi.status() != WL_CONNECTED)
+  {Serial.print("CONEXÃO WIFI --- OK");
+    }else{Serial.print("CONEXÃO WIFI --- FALHA");
+      }
+
+// Pegando endereço local de IP utilizado para configurar e logar o hardware ao banco de DADOS
+  Serial.println();
+  Serial.print("IP DE CONEXÃO: ");
+  Serial.println(WiFi.localIP());
+  Serial.println();
+ 
+// Configurando a conexão ao banco de dados FIREBASE
+  Serial.printf("Firebase Client v%s\n\n", FIREBASE_CLIENT_VERSION);
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = email;
+  auth.user.password = senha;
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+  //config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config, &auth);//Iniciando servidor FIREBASE, autenticando e configurando
+
+//Inicia servidor WEB
+  server.on("/", handleRoot);
+  server.on("/login", handleLogin);
+  server.on("/logout", handleLogout);
+  server.onNotFound(handleNotFound);
+
+//Gravação do cabeçalho para requisições http
+  const char * headerkeys[] = {"User-Agent","Cookie"};
+  size_t headerkeyssize = sizeof(headerkeys)/sizeof(char*);
+
+//Pedido para o servidor rastrear esse cabeçalho
+  server.collectHeaders(headerkeys, headerkeyssize );
+  server.begin(); //Iniciando servidor web  
+
+//Chamando biblioteca do relógio online
+  setupNTP();
+
+// Carrega o id do usuario do BANCO DE DADOS
+  id_usuario = auth.token.uid.c_str();
+
+} //FIM DO SETUP
+
+void loop()
+{
+// Inicia o servidor WEB
+server.handleClient();
+
+// Leitura da memória FLASH do hardware
+get_preferences();
+
+// Configura e recupera a formatação de data e hora 
+datas     = ntpClient.getFormattedDate();
+horarios  = ntpClient.getFormattedTime();
+Date date = getDate();
+
+// Mostra no monitor serial dados pertinentes ao dispositivo
+Serial.println (dayOfWeekNames[date.dayOfWeek]);
+Serial.println (datas);
+Serial.println (horarios);
+Serial.print ("E-MAIL CADASTRADO: ");
+Serial.println (email);
+//Serial.print ("SENHA: ");
+//Serial.println (senha);
+Serial.print ("ID DO DISPOSITIVO: ");
+Serial.println (id_dispositivo);
+Serial.print ("ENDEREÇO IP PARA CADASTRAR DISPOSITIVO: ");
+Serial.println (WiFi.localIP());
+
+delay(1000);
+
+// Carrega o valor lido da temperatura para mostrar no monitor e salvar no BANCO DE DADOS
+valTemperatura = thermocouple.readCelsius();
+    
+// Set dos valores no BANCO DE DADOS 
+    if (millis() - dataMillis > 30000)
+    {
+      if(email != "NULL" && senha != "NULL" && Firebase.ready())
+        {
+        Serial.println ("CONEXÃO OK");
+        // SET TEMPERATURA NO BANCO DE DADOS
+        set_temperatura ();
+        }else
+          {
+          Serial.println ("FALHA CONEXÃO");
+          Serial.println ("CADASTRE UM E-MAIL E O ID PARA CARREGAR NO BANCO DE DADOS");
+          }
+      //PEGA OS VALORES INCERIDOS NO BANCO DE DADOS    
+      ver_temperatura ();
+
+      //CONTROLE  TEMPERATURA, LIGANDO OU DESLIGANDO O AQUECIMENTO
+    if(valTemperatura<=setpoint){
+        digitalWrite(LED_BUILTIN, HIGH);
+        digitalWrite(rele, HIGH);
+      }else{
+          digitalWrite(LED_BUILTIN, LOW);
+          digitalWrite(rele, LOW);
+        }
+    }
+}//FIM DO LOOP
+
+// Inicia a conexão do WIFI Manager
+void inicia_wifi_manager()
+{
+    WiFi.mode(WIFI_STA);
+    WiFiManager wm;
+    //wm.resetSettings();
+    bool res;
+    res = wm.autoConnect("EmidioTECH","123456789"); // password protected ap
+    if(!res) {
+        Serial.println("FALHA NA CONEXÃO");
+        ESP.restart();
+        wm.resetSettings();
+    } 
+    else {
+         Serial.println("CONEXÃO BEM SUCEDIDA");
+    }
+  }
+
+// Carrega os valores de temperatura do BANCO DE DADOS
+void ver_temperatura()
+{
+    Firebase.RTDB.getInt(&fbdo, id_usuario + "/" + id_dispositivo + "/temperatura/" , &temp);
+    Firebase.RTDB.getInt(&fbdo, id_usuario + "/" + id_dispositivo + "/setpoint/" , &setpoint);
+    Serial.print("Temperatura local: ");
+    Serial.println(temp);
+    Serial.print("Set point temperatura: ");
+    Serial.println(setpoint);
+}
+
+// Insere os valores de temperatura no BANCO DE DADOS
+void set_temperatura()
+{
+    dataMillis = millis();
+    Serial.printf("Set int... %s\n", Firebase.RTDB.setInt(&fbdo, id_usuario + "/" + id_dispositivo + "/temperatura/" , valTemperatura) ? "ok" : fbdo.errorReason().c_str());
+    Serial.printf("Set int... %s\n", Firebase.RTDB.setInt(&fbdo, id_usuario + "/" + id_dispositivo + "/logtemperatura/" + datas + "/" + horarios, count) ? "ok" : fbdo.errorReason().c_str());
+    
+    //FUNÇÃO PUSH
+    // Serial.printf("Set int... %s\n", Firebase.RTDB.pushInt(&fbdo, "/temperatura/", count++) ? "ok" : fbdo.errorReason().c_str());
+    //Serial.printf("Set int... %s\n", Firebase.RTDB.setInt(&fbdo, "temperatura/" + hora, count++) ? "ok" : fbdo.errorReason().c_str());
+}
+
+// Faz o setup para o RELÓGIO ONLINE
+void setupNTP()
+{
+    //Inicializa o client NTP
+    ntpClient.begin();
+    //Espera pelo primeiro update online
+    Serial.println("Aguarde primeiro update data/hora");
+    while(!ntpClient.update())
+    {
+        Serial.print(".");
+        ntpClient.forceUpdate();
+        delay(500);
+    }
+    Serial.println();
+    Serial.println("Primeiro update servidor NTP completo");
+}
+
+// Configura o padrão utilizado de data e hora DD/MM/YYY
+Date getDate()
+{
+    //Recupera os dados de data e horário usando o client NTP
+    char* strDate = (char*)ntpClient.getFormattedDate().c_str();
+
+    //Passa os dados da string para a struct
+    Date date;
+    sscanf(strDate, "%d-%d-%dT%d:%d:%dZ", 
+                    &date.year, 
+                    &date.month, 
+                    &date.day,
+                    &date.hours, 
+                    &date.minutes,
+                    &date.seconds);
+
+    //Dia da semana de 0 a 6, sendo 0 o domingo
+    date.dayOfWeek = ntpClient.getDay();
+    return date;
+}
+
+
+// Verifica o cadastramento do hardware no sistema
+bool is_authentified(){
+  Serial.println("Enter is_authentified");
+  if (server.hasHeader("Cookie")){
+    Serial.print("Found cookie: ");
+    String cookie = server.header("Cookie");
+    Serial.println(cookie);
+    if (cookie.indexOf("ESPSESSIONID=1") != -1)
+    {
+      Serial.println("AUTENTICADO COM SUCESSO");
+      return true;
+    }
+  }
+  Serial.println("FALHA NA AUTENTICAÇÃO");
+ // msg = "CADASTRE O DISPOSITIVO CORRETAMENTE";
+  return false;
+}
+
+// Carrega a pagina de cadastro do hardware quando não cadastrado
+void handleLogin(){
+  String msg;
+  if (server.hasHeader("Cookie")){
+    Serial.print("Found cookie: ");
+    String cookie = server.header("Cookie");
+    Serial.println(cookie);
+  }
+  if (server.hasArg("DISCONNECT")){
+    Serial.println("DESCONECTANDO");
+    server.sendHeader("Location","/login");
+    server.sendHeader("Cache-Control","no-cache");
+    server.sendHeader("Set-Cookie","ESPSESSIONID=0");
+    server.send(301);
+    return;
+  }
+  if (server.hasArg("USERNAME") && server.hasArg("PASSWORD")){
+    if (server.arg("USERNAME") != "NULL" &&  server.arg("PASSWORD") != "NULL" ){
+      server.sendHeader("Location","/");
+      server.sendHeader("Cache-Control","no-cache");
+      server.sendHeader("Set-Cookie","ESPSESSIONID=1");
+      email = (server.arg("USERNAME"));
+      senha = (server.arg("PASSWORD"));
+      server.send(301);
+      set_preferences();
+      Serial.println("CADASTRANDO..... REINICIANDO DISPOSITIVO.....");
+      ESP.restart(); //REINICIA PARA SETAR CORRETAMENTE O FIREBASE
+      return;
+    }
+    msg = "CADASTRE O DISPOSITIVO CORRETAMENTE";
+    Serial.println("FALHA NO CADASTRO");    
+       
+  }
+  String content = "<html><body><center><form action='/login' method='POST'><b>PARA REGISTRAR O DISPOSITIVO DIGITE SEU E-MAIL E A SENHA DO APLICATIVO</b><br><br>";
+  content += "E-MAIL: <input type='text' name='USERNAME' placeholder=''><br>";
+  content += "SENHA:  <input type='password' name='PASSWORD' placeholder=''><br><br>";
+  content += "        <input type='submit' name='SUBMIT' value='REGISTRAR'></form>" + msg + "<br>";
+  content += "Para remover o dispositivo do servidor e apagar todas as informações <a href='/logout'>CLIQUE AQUI</a></body></html>";
+  server.send(200, "text/html", content);
+}
+
+// Carrega pagina quando cadastro com sucesso
+void handleRoot(){
+  Serial.println("Enter handleRoot");
+  String header;
+  if (!is_authentified()){
+    server.sendHeader("Location","/login");
+    server.sendHeader("Cache-Control","no-cache");
+    server.send(301);
+    return;
+  }
+  String content = "<html><body><H2><center>DISPOSITIVO CADASTRADO COM SUCESSO</H2><br>";
+  if (server.hasHeader("User-Agent")){
+    content += "the user agent used is : " + server.header("User-Agent") + "<br><br>";
+  }
+  get_preferences();
+  content += "E-MAIL cadastrado: " + email + "<br>";
+  content += "ID do dispositivo: " + id_dispositivo + "<br><br>";
+  content += "Clique em DESCONECTAR para cadastrar outro usuario <a href=\"/login?DISCONNECT=YES\">DESCONECTAR</a><br>";
+  server.send(200, "text/html", content);
+}
+
+// Carrega pagina de LOGOUT para saida do BANCO DE DADOS
+void handleLogout(){
+  String content = "<html><body><center><form action='/logout' method='POST'><b>DISPOSITIVO DESCONECTADO DO SERVIDOR</b><br><br>";
+  content += "Os dados do dispositivo não serão carregados no servidor<br>";
+  content += "Para reconectar ao servidor digite novamente o usuario e a senha do aplicativo<br><br>";
+  content += "<a href='/login'>VOLTAR</a><br>";
+  server.send(200, "text/html", content);
+  remove_preferences();
+  ESP.restart(); //REINICIA PARA SETAR CORRETAMENTE O FIREBASE
+}
+
+// Carrega pagina de ERRO quando não consegue cadastrar o hardware
+void handleNotFound(){
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET)?"GET":"POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i=0; i<server.args(); i++){
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+  server.send(404, "text/plain", message);
+}
+
+// Pega os dados de E-MAIL e SENHA da memória FLASH do hardware
+void get_preferences(){
+  preferences.begin("config_aleats", true);
+  email = preferences.getString("email_flash", "NULL");
+  senha = preferences.getString("senha_flash", "NULL");
+  preferences.end(); 
+}
+
+// Insere os dados de E-MAIL e SENHA da memória FLASH do hardware
+void set_preferences(){
+  preferences.begin("config_aleats", false);
+  preferences.putString("email_flash", email);
+  preferences.putString("senha_flash", senha);
+  preferences.end();
+}
+
+// Remove os dados de E-MAIL e SENHA da memória FLASH do hardware
+void remove_preferences(){
+  preferences.begin("config_aleats", false);
+  preferences.remove("email_flash");
+  preferences.remove("senha_flash");
+  preferences.end();
+}
